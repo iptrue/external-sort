@@ -4,8 +4,8 @@ import { pipeline } from "stream/promises";
 import readline from "readline";
 import buffer from "buffer";
 
-const BUFFER_CAPACITY = 100_000_000;
-const MAX_MEM_USE = 100_000_000;
+const BUFFER_CAPACITY = 10_000_000;
+const MAX_MEM_USE = 10_000_000;
 const FILE_SIZE = 1_000_000_000;
 
 (async function () {
@@ -16,7 +16,7 @@ const FILE_SIZE = 1_000_000_000;
 
 async function externSort(fileName: string) {
   const file = createReadStream(fileName, {
-    highWaterMark: BUFFER_CAPACITY / 10,
+    highWaterMark: BUFFER_CAPACITY,
   });
   const lines = readline.createInterface({ input: file, crlfDelay: Infinity });
   const v: string[] = [];
@@ -25,7 +25,7 @@ async function externSort(fileName: string) {
   for await (let line of lines) {
     size += line.length;
     v.push(line);
-    if (size > MAX_MEM_USE / 10) {
+    if (size > MAX_MEM_USE) {
       await sortAndWriteToFile(v, tmpFileNames);
       size = 0;
     }
@@ -45,38 +45,49 @@ async function merge(tmpFileNames: string[], fileName: string) {
   console.log("merging result ...");
   const resultFileName = `${fileName.split(".txt")[0]}-sorted.txt`;
   const file = createWriteStream(resultFileName, {
-    highWaterMark: BUFFER_CAPACITY / 10,
+    highWaterMark: BUFFER_CAPACITY,
   });
-  const activeReaders = tmpFileNames.map((name) =>
-    readline
-      .createInterface({
-        input: createReadStream(name, { highWaterMark: BUFFER_CAPACITY / 10 }),
-        crlfDelay: Infinity,
-      })
-      [Symbol.asyncIterator]()
-  );
-  const values = await Promise.all<string>(
-    activeReaders.map((r) => r.next().then((e) => e.value))
-  );
-  return pipeline(async function* () {
-    const reducer = (prev: any, cur: any, idx: number) =>
-      cur < prev[0] ? [cur, idx] : prev;
-    while (activeReaders.length > 0) {
-      const [minVal, i] = values.reduce(reducer, [
-        "~".repeat(buffer.constants.MAX_STRING_LENGTH / 2 - 1),
-        0,
-      ]);
+  try {
+    const activeReaders = tmpFileNames.map((name) =>
+      readline
+        .createInterface({
+          input: createReadStream(name, {
+            highWaterMark: Math.floor(BUFFER_CAPACITY / tmpFileNames.length),
+          }),
+          crlfDelay: Infinity,
+        })
+        [Symbol.asyncIterator]()
+    );
+    const values: any[] = [];
 
-      yield `${minVal}\n`;
-      const res = await activeReaders[i].next();
-      if (!res.done) {
-        values[i] = res.value;
-      } else {
-        values.splice(i, 1);
-        activeReaders.splice(i, 1);
-      }
+    for await (const reader of activeReaders) {
+      const result = await reader.next();
+      values.push(result.value);
     }
-  }, file);
+
+    const timesToRepeat = buffer.constants.MAX_STRING_LENGTH / 2 - 1;
+    await pipeline(async function* () {
+      const reducer = (prev: any, cur: any, idx: number) =>
+        cur < prev[0] ? [cur, idx] : prev;
+      while (activeReaders.length > 0) {
+        const [minVal, i] = values.reduce(reducer, [
+          "~".repeat(timesToRepeat),
+          0,
+        ]);
+
+        yield `${minVal}\n`;
+        const res = await activeReaders[i].next();
+        if (!res.done) {
+          values[i] = res.value;
+        } else {
+          values.splice(i, 1);
+          activeReaders.splice(i, 1);
+        }
+      }
+    }, file);
+  } catch (e) {
+    console.log(e);
+  }
 }
 
 async function sortAndWriteToFile(v: string[], tmpFileNames: string[]) {
@@ -86,7 +97,7 @@ async function sortAndWriteToFile(v: string[], tmpFileNames: string[]) {
   console.log(`creating tmp file: ${tmpFileName}`);
   await pipeline(
     v.map((e) => `${e}\n`),
-    createWriteStream(tmpFileName, { highWaterMark: BUFFER_CAPACITY / 10 })
+    createWriteStream(tmpFileName, { highWaterMark: BUFFER_CAPACITY })
   );
   v.length = 0;
 }
